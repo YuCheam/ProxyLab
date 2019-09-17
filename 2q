@@ -1,0 +1,270 @@
+#include <stdio.h>
+#include "csapp.h"
+
+#define MAX_OBJECT_SIZE 7204056
+/* You won't lose style points for including this long line in your code */
+static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+
+/* Cache Variables */
+typedef struct cache_entry{
+  char url[MAXLINE];
+  char response_header[MAXLINE];
+  char file_buf[MAX_OBJECT_SIZE];
+  struct cache_entry *next;
+  } cache_entry;
+
+cache_entry *head;
+
+/* Function Declarations */
+void doit(int fd);
+void read_requesthdrs(rio_t *rp, char buf[], char *hostname, char *path, 
+   char *proxy_request);
+void parse_uri(char *uri, char *hostname, char *path, char *port);
+void send_request(int clientfd, char* proxy_request, char *port, char *hostname,
+    int *entry_found, char *url);
+cache_entry *find_entry(int *entry_found, char *url);
+void get_url(char *uri, char *url);
+
+int main(int argc, char **argv)
+{
+  int listenfd, conn_fd;
+  socklen_t clientlen;
+  struct sockaddr_storage clientaddr;
+  char client_hostname[MAXLINE], client_port[MAXLINE];
+  
+  /*Initializing linked cache list */
+  head = (cache_entry*)malloc(sizeof(cache_entry));
+  head->next = NULL;
+
+  printf("%s", user_agent_hdr);
+  
+  /* Check command line arguement */
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    exit(1);
+  }
+
+  Signal(SIGPIPE, SIG_IGN);
+
+  listenfd = Open_listenfd(argv[1]);
+  while (1) {
+    clientlen = sizeof(clientaddr);
+    //add error handling to conn_fd
+    conn_fd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
+    Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE,
+        client_port, MAXLINE, 0);
+    printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
+    doit(conn_fd);
+    Close(conn_fd);
+  }
+
+
+  return 0;
+}
+
+void doit(int fd) {
+  char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE],
+       proxy_request[MAXLINE], hostname[MAXLINE], path[MAXLINE], url[MAXLINE];
+  char port[MAXLINE] = "80";
+  int *entry_found = malloc(sizeof(entry_found));
+  rio_t rio;
+
+  /* Read request line and headers */
+  rio_readinitb(&rio, fd);
+  rio_readlineb(&rio, buf, MAXLINE);
+  printf("Request headers:\n");
+  printf("%s", buf);
+  sscanf(buf, "%s %s %s", method, uri, version);
+
+
+  if (strcasecmp(method, "GET")) {
+    /* Error handling */
+    printf("Not implemented");
+    return;
+  }
+
+  get_url(uri, url);
+  
+  parse_uri(uri, hostname, path, port); 
+  read_requesthdrs(&rio, buf, hostname, path, proxy_request);
+  printf("%s", proxy_request);
+
+  /*Sending request to server */
+  send_request(fd, proxy_request, port, hostname, entry_found, url);
+}
+
+void read_requesthdrs(rio_t *rp, char buf[], char *hostname, char *path,
+    char *proxy_request) {
+  char *temp;
+
+  /* Creating the GET request header */
+  strcpy(proxy_request, "GET ");
+  strcat(proxy_request, path);
+  strcat(proxy_request, " HTTP/1.0\r\n");
+
+  /* Editing the client request headers if they come */
+  while (strcmp(buf, "\r\n")) {
+    rio_readlineb(rp, buf, MAXLINE);
+    if (strstr(buf, "User-Agent:")) {
+      strcat(proxy_request, user_agent_hdr);
+    } else if (strstr(buf, "Host:")) {
+      temp = strstr(buf, "Host: ");
+      temp += strlen("Host: ");
+      strcpy(temp, hostname);
+      strcat(temp, "\r\n");
+      strcat(proxy_request, buf);
+    } else if(strstr(buf, "Proxy-Connection:")) {
+      temp = strstr(buf, ":");
+      temp += 1;
+      strcpy(temp, " close\r\n");
+      strcat(proxy_request, buf);
+    } else if (strstr(buf, "Connection:")) {
+      temp = strstr(buf, ":");
+      temp += 1;
+      strcpy(temp, " close\r\n");
+      strcat(proxy_request, buf);
+    } else {
+      strcat(proxy_request, buf);
+    }
+  }
+
+  /*Adding Headers if they are missing*/
+  if (strstr(proxy_request, "\r\nConnection:") == NULL) {
+    temp = strstr(proxy_request, "\r\n\r\n");
+    temp += strlen("\r\n");
+    strcpy(temp, "Connection: close\r\n\r\n"); 
+  }
+
+  return;
+}
+
+void parse_uri(char *uri, char *hostname, char *path, char *port) {
+  char *temp, *temp2;
+  temp = strstr(uri, "//"); 
+
+  if (temp != NULL) {
+    temp += 2;
+    temp2 = strpbrk(temp, "/");
+
+    if (temp2 != NULL) {
+      sscanf(temp2, "%s", path);
+      strcpy(temp2, "\0");
+    }
+    
+    temp2 = strpbrk(temp, ":");
+    if (temp2 != NULL) {
+      temp2 += 1;
+      sprintf(port, "%s", temp2);
+      strcpy(temp2-1, " ");
+    }
+
+    sscanf(temp, "%s", hostname);
+  } else {
+    /* Figure out cache entry for when there is no http */
+    hostname = uri;
+  }
+}
+
+void send_request(int clientfd, char *proxy_request, char *port, char *hostname,
+     int *entry_found, char *url) { 
+  cache_entry *entry;
+  int fd, size;
+  char buf[MAXLINE], data[MAXLINE];
+  char save_header[MAXLINE], save_data[MAX_OBJECT_SIZE];
+  int content_length = 0;
+  rio_t rio;
+
+  entry = find_entry(entry_found, url);
+
+  if (entry) {
+    //write response headers to client 
+    printf("%s", entry->response_header);
+    rio_writen(clientfd, entry->response_header, 
+        strlen(entry->response_header));
+
+    //write data to client 
+    rio_writen(clientfd, entry->file_buf, MAX_OBJECT_SIZE);
+
+  } else { 
+    fd = open_clientfd(hostname, port);
+    rio_writen(fd, proxy_request, strlen(proxy_request)); 
+    
+    /* Read and Write Response */
+    rio_readinitb(&rio, fd);
+    rio_readlineb(&rio, buf, MAXLINE);
+    rio_writen(clientfd, buf, strlen(buf));
+    printf("%s", buf);
+    strcat(save_header, buf);
+    
+    while(strcmp(buf, "\r\n")) {
+      rio_readlineb(&rio, buf, MAXLINE);
+      rio_writen(clientfd,buf,strlen(buf));
+      printf("%s", buf);
+      strcat(save_header, buf);
+    }
+
+    /* Continuous write data to client */
+    while ((size = rio_readnb(&rio, data, MAXLINE)) != 0) {
+      content_length += size;
+      rio_writen(clientfd, data, size);
+      strcat(save_data, data);
+    }
+    
+    /* Checking if filesize of data is larger than MAX_OBJECT_SIZE */
+    if (content_length <= MAX_OBJECT_SIZE) {  
+      if (strlen(head->url)) {
+        entry = malloc(sizeof(entry));
+        entry->next = head;
+        head = entry;
+      } 
+      strcpy(head->url, url);
+      strcpy(head->response_header, save_header);
+      strcpy(head->file_buf, save_data);
+    }
+  }
+  
+  close(fd);
+}
+
+/* Checks to see whether url is in cache, and adds an entry if it is not
+ * Returns the pointer to the entry if found
+ * Sets value of entry_found = 1 if entry is in cache and 0 if not*/
+cache_entry *find_entry(int *entry_found, char *url) {
+  cache_entry *temp_node, *next;
+
+  /* Iterating through linked list to find entry */
+  temp_node = head;
+  
+  /* Checking head */
+  if (!strcmp(temp_node->url, url)) {
+    *entry_found = 1;
+    return head;
+  } else if (temp_node->next == NULL) {
+    *entry_found = 0;
+    return NULL;
+  }
+
+  while (temp_node->next) {
+    next = temp_node->next;
+    
+    if (!strcmp(url, next->url)) {
+      *entry_found = 1;
+      return next;
+    }
+
+    temp_node = next;
+  }
+
+  *entry_found = 0;
+  return NULL;
+}
+
+void get_url(char *uri, char *url) {
+  char *temp;
+
+  temp = strstr(uri, "//");
+  temp += 2;
+  sscanf(temp, "%s", url);
+  
+  return;
+}
